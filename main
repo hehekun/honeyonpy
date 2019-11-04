@@ -1,0 +1,342 @@
+<p style="background-color:#00b0f0; padding: 5px; margin: 3px auto; widows:3; orphans:3;"><span style="color:#ffffff;font-size: 24px; font-weight: bold;">利用python搭建蜜罐</span></p>
+​
+###  一、 任务描述
+​
+之前的蜜罐都是利用honeyd来搭建的，今天我们就自己用python搭建一个蜜罐！！
+
+###  二、 任务目标
+​
+一定程度上的掌握python，并且理解如何利用他搭建蜜罐
+​
+###  三、 任务环境
+​
+ubuntu18.04.3 
+python2.7
+​
+###  四、 任务实施
+​
+1.1 自己如何实现低交互式伪系统蜜罐
+    首先我们要理解，经过利用arp协议，所有发向虚拟蜜罐的数据包都会发向我们本机，我们要做的就是对这些数据包进行收集与处理。
+    那么我们应该监听自己的网卡，不过不监听自己的ip，而是监听蜜罐的ip。
+    再根据数据包的结构对数据包进行解构分析出http头的各项值和数据包数据，这一步可以交给python的库来做。
+    最后就是根据对应的请求做出对应的回复(可不做，毕竟我们只是为了捕获攻击而已
+
+1.2 python
+    python是一个介于shell和c语言之间的语言，既跟shell一样方便快捷，又能像c一样封装实现很多功能。
+    我很想在这里交给大家如何写python，但那就又是另一门课的事情了。
+
+1.3 python实现(上)
+    首先，为了能够监听到蜜罐的ip，我们要先按照固定格式来创建一个蜜罐
+    name:linux
+    port:80
+    ip:192.168.28.134
+    保存为honeydconf.txt中
+
+    当然，python就要读取这些设置并且在监听的过程使用。
+    f = open("honeydconf.txt","r")
+    conf = f.read()
+    confname=conf.split("name:",1)[1]
+    confname=confname.split("\n",1)[0]
+    confport=conf.split("port:",1)[1]
+    confport=conf.split("\n",1)[0]
+    confip=conf.split("ip:",1)[1]
+
+    可以读取配置之后，我们就需要根据配置来监听网卡
+    def main(_,port,ip):
+    try:
+        # 三行命令分别创建socket、绑定ip端口、设置排队数量
+        myserver = socket.socket()
+        myserver.bind((ip, port))
+        myserver.listen(1)
+        # daemon命令用于让子线程跟随主线程一起结束
+        thread_s = threading.Thread(target=thread_server, args=(myserver,))
+        thread_s.setDaemon(True)
+        thread_s.start()
+        # 我也不知道这是什么奇葩做法。。。反正目的就是Ctrl+C可以终止程序然后阅读bug信息。。。
+        while True: time.sleep(999)
+    except KeyboardInterrupt:
+        print("sys exit")
+    finally:
+        myserver.close()
+    这个函数接收参数，监听网卡。然后创建线程用来接收，分析数据
+
+    光是监听可有点不够看，我们当然要做一点别的功能啦
+    那么现在，我们就要来为每一个线程指定任务。
+    def thread_server(myserver):
+    #循环接收不同ip，端口信息
+    while True:
+        conn, addr = myserver.accept()
+        thread_p = threading.Thread(target=thread_proxy, args=(conn, addr))
+        thread_p.setDaemon(True)
+        thread_p.start()
+
+    def thread_proxy(client, addr):
+    thread_name = threading.currentThread().name
+    print('%s->客户端接入:%s\n'%(thread_name, str(addr)))
+    # 分离和分析请求头
+    request = client.recv(MAX_HEADER_SIZE)
+    requestHeader = splitHeader(request)
+    # 请求头过长！
+    if len(requestHeader)>MAX_HEADER_SIZE-11:
+        print("%s->Host太长！限制长度为%ds"%(thread_name, MAX_HEADER_SIZE-11))
+        client.close()
+        return
+    # 解析Host
+    raw_host = getHeader(requestHeader, "Host")
+    if not raw_host:
+        print("%s->Host解析不正常%s"%(thread_name, str(addr)))
+        print("%s->request_header:\n%s"%(thread_name, requestHeader))
+        client.close()
+        return
+    # 接受剩余Body
+    if len(requestHeader) < len(request)-4:
+        content_size = getHeader(requestHeader, "content-length")
+        request = recvBody(client, request, len(requestHeader) + 4 + int(content_size) if content_size else -1)
+    #建立 socket tcp 连接并发送原始请求头
+    print (request)
+
+    每一个线程都接收数据包，分解数据包，分成包头和数据，解析出host和各个请求头与其值。
+    其实完全没有必要进行分解的步骤，不过这样的步骤可以让我们在中间添加一些制定条件或者过滤条件。
+
+    当然，为了实现蜜罐的作用，我们应该把后面的print (request)改成
+    file=open("pkt.txt","wr")
+    file.write(request)
+
+    如此，就将发向我们的数据包保存了下来。
+
+    当然，我们还需要向请求者提供我们的虚拟服务
+    res = open("test.html","r")
+    response = res.read()
+
+    client.sendall(response)
+    
+    client.close()
+    test中写我们的虚拟服务
+
+    在把一些函数写好，这里主要是利用数据包的格式来分析数据包
+    def getHeader(string, name): //解析请求头
+    name = name.upper()
+    base, i,l=0, 0,len(string)
+    if 'HTTP/1.1' in string:   
+        string=string.split('\r\n',1)[1]
+        l=len(string)
+    while i<l:
+        # 根据约定，空行代表头的结束
+        if string[i] == "\r" and i<l-1 and string[i+1] == "\n" : break
+        # 找第一个冒号，拆解信息头
+        while i<l and string[i] != ":" : 
+            i+=1
+        # 判断信息头
+        if i<l and string[base:i].strip().upper() == name:
+            # 将base定位至冒号后面
+            base = i+1
+            # 找到行尾，获得信息
+            while i<l and not(string[i] == "\n" and string[i-1] == "\r") : i+=1
+            return string[base:i-1]
+        else:
+            # 找到行尾，跳过
+            while i<l and not(string[i] == "\n" and string[i-1] == "\r") : i+=1
+            base, i = i+1, i+1
+    return None
+
+    def splitHeader(string): //分离请求头
+        i, l = 3, len(string)
+        while i<l and (string[i] != "\n" or string[i-3:i+1] !="\r\n\r\n") : i+=1
+        return string[:i-3]
+
+    def recvBody(conn, base, size): //接收数据部分
+        if size==-1:
+            while base[-5:] != "\r\n0\r\n\r\n" : base += conn.recv(RECV_SIZE)
+        else:
+            while len(base)<size:base += conn.recv(RECV_SIZE)
+        return base
+
+    再写一些库和全局变量，程序就可以跑了！
+    如此，我们的蜜罐就搭建完毕了
+
+    当然，你可能会看的有些云里雾里的，不要担心，下面，我会以整个程序为主线来给大家分析蜜罐的实现过程
+
+2.1 来看看代码吧
+    #! /usr/bin/python
+#coding=utf-8
+from __future__ import unicode_literals, print_function
+import socket, sys, traceback, threading, time, select
+import sys
+import importlib
+
+importlib.reload(sys)
+MAX_HEADER_SIZE = 4096
+RECV_SIZE = 512 
+confip=""
+confport=80
+
+def getHeader(string, name):
+    name = name.upper()
+    base, i,l=0, 0,len(string)
+    string=string.decode('utf-8')
+    if 'HTTP/1.1' in string:   
+        string=string.split('\r\n',1)[1]
+        l=len(string)
+    while i<l:
+        # 根据约定，空行代表头的结束
+        if string[i] == "\r" and i<l-1 and string[i+1] == "\n" : break
+        # 找第一个冒号，拆解信息头
+        while i<l and string[i] != ":" : 
+            i+=1
+        # 判断信息头
+        if i<l and string[base:i].strip().upper() == name:
+            # 将base定位至冒号后面
+            base = i+1
+            # 找到行尾，获得信息
+            while i<l and not(string[i] == "\n" and string[i-1] == "\r") : i+=1
+            return string[base:i-1]
+        else:
+            # 找到行尾，跳过
+            while i<l and not(string[i] == "\n" and string[i-1] == "\r") : i+=1
+            base, i = i+1, i+1
+    return None
+
+def splitHeader(string):
+    i, l = 3, len(string)
+    while i<l and (string[i] != "\n" or string[i-3:i+1] !="\r\n\r\n") : i+=1
+    return string[:i-3]
+
+def transHost(raw_host):
+    # 将raw_host解析为host和port
+    for i in range(len(raw_host)): 
+        if raw_host[i] == ":" : return raw_host[:i].strip(), int(raw_host[i+1:])
+    else : return raw_host.strip(), 8081
+
+def recvBody(conn, base, size):
+    if size==-1:
+        while base[-5:] != "\r\n0\r\n\r\n" : base += conn.recv(RECV_SIZE)
+    else:
+        while len(base)<size:base += conn.recv(RECV_SIZE)
+    return base
+
+
+def thread_proxy(client, addr):
+
+    thread_name = threading.currentThread().name
+
+    print('%s->client in:%s\n'%(thread_name, str(addr)))
+
+    # 分离和分析请求头
+    request = client.recv(MAX_HEADER_SIZE)
+    requestHeader = splitHeader(request)
+    # 请求头过长！
+    if len(requestHeader)>MAX_HEADER_SIZE-11:
+        print("%shost too long->limit to%ds"%(thread_name, MAX_HEADER_SIZE-11))
+        client.close()
+        return
+    # 解析Host
+    raw_host = getHeader(requestHeader, "Host")
+    if not raw_host:
+        print("%s->Host wrong%s"%(thread_name, str(addr)))
+        print("%s->request_header:\n%s"%(thread_name, requestHeader))
+        client.close()
+        return
+    
+    # 接受剩余Body
+    if len(requestHeader) < len(request)-4:
+        content_size = getHeader(requestHeader, "content-length")
+        request = recvBody(client, request, len(requestHeader) + 4 + int(content_size) if content_size else -1)
+    
+    #建立 socket tcp 连接并发送原始请求头
+    print (request)
+
+        
+    # 分离和分析响应头
+    res = open("index.txt","r")
+    response = res.read()
+    response = bytes(response,encoding = "utf8")
+
+    client.sendall(response)
+    
+    client.close()
+
+def thread_server(myserver):
+    #循环接收不同ip，端口信息
+    while True:
+        conn, addr = myserver.accept()
+        thread_p = threading.Thread(target=thread_proxy, args=(conn, addr))
+        thread_p.setDaemon(True)
+        thread_p.start()
+
+# 启动server和监听退出命令
+def main(_,port=80):
+    try:
+        # 三行命令分别创建socket、绑定ip端口、设置排队数量
+        myserver = socket.socket()
+        myserver.bind((confip, confport))
+        myserver.listen(1024)
+        # daemon命令用于让子线程跟随主线程一起结束
+        thread_s = threading.Thread(target=thread_server, args=(myserver,))
+        thread_s.setDaemon(True)
+        thread_s.start()
+        # 我也不知道这是什么奇葩做法。。。反正目的就是Ctrl+C可以终止程序然后阅读bug信息。。。
+        while True: time.sleep(999)
+    except KeyboardInterrupt:
+        print("sys exit")
+    finally:
+        myserver.close()
+''' conf文件的格式
+    name:linux
+    port:80
+    ip:192.168.12.126
+'''
+# 命令入口
+
+if __name__ == '__main__':
+    f = open("honeydconf.txt","r")
+    conf = f.read()
+    confname=conf.split("name:",1)[1]
+    confname=confname.split("\n",1)[0]
+    confport=conf.split("port:",1)[1]
+    confport=confport.split("\n",1)[0]
+    confport=int(confport)
+    confip=conf.split("ip:",1)[1]
+    try:
+        print("start server")
+        main(*sys.argv)
+    except Exception as e:
+        print("error exit")
+        traceback.print_exc()
+    finally:
+        print("end server")
+    sys.exit(0)
+
+
+2.2 从整体代码分析
+    上面就是一个我自己实现的蜜罐。
+    我将用这个例子来给大家讲解这个蜜罐
+
+    从函数入口开始看，我们先按照固定格式读取了配置文件
+    conf = f.read()
+
+    再根据配置文件设置了socket监听
+    myserver = socket.socket()
+    myserver.bind((confip, confport))
+
+    抓取数据包，分析数据包，创建状态回显
+    request = recvBody(client, request, len(requestHeader) + 4 + int(content_size) if content_size else -1)
+
+    传输数据包，再提供虚拟服务。
+    res = open("index.txt","r")
+    response = res.read()
+    client.sendall(response)
+
+    这就是程序基本的运行流程，实现了一个蜜罐所需要实现的基本功能
+    当然，我所返回的只是基础的网页，为了能够更加真实的模拟主机
+    我们还可以通过修改回传数据包的响应头部分来添加一些签名和参数。
+
+2.3 运行
+    我们在ubuntu下写好index.txt honeydconf.txt 
+    python3 honey.py
+
+    访问192.168.28.134
+    完美
+
+
+
+
